@@ -5,10 +5,16 @@ import { TavilySearch } from "@langchain/tavily";
 import { ChatOpenAI } from "@langchain/openai";
 import { Annotation } from "@langchain/langgraph";
 import { HumanMessage, AIMessage, BaseMessage } from "@langchain/core/messages";
-import { tool, Tool } from "@langchain/core/tools";
 import { StateGraph, END, START } from "@langchain/langgraph";
-import axios from "axios";
-import { z } from "zod";
+import { enrichCompanyTool, enrichPersonTool } from "./tools";
+
+export interface Lead {
+  name: string;
+  role: string;
+  email: string;
+  linkedin: string;
+}
+
 // Verify required environment variables
 if (!process.env.OPENAI_API_KEY) {
   console.error("OPENAI_API_KEY not found in environment variables");
@@ -25,84 +31,14 @@ if (!process.env.APOLLO_API_KEY) {
   process.exit(1);
 }
 
-// Define a tool to get company info from Apollo
-class ApolloCompanyTool extends Tool {
-  name = "apollo_company_info";
-  description = "Gets company information from Apollo.io API";
-
-  constructor() {
-    super();
-  }
-
-  async _call(domain: string): Promise<string> {
-    try {
-      const url = "https://api.apollo.io/v1/organizations/enrich";
-      const response = await axios.get(url, {
-        params: {
-          domain: domain,
-        },
-        headers: {
-          "x-api-key": process.env.APOLLO_API_KEY,
-        },
-      });
-
-      if (response.data.organization) {
-        return JSON.stringify(response.data.organization);
-      } else {
-        return JSON.stringify({ error: "Company not found" });
-      }
-    } catch (error) {
-      return JSON.stringify({ error: `Apollo API error: ${error}` });
-    }
-  }
-}
-
 // Build the company enrichment agent
 async function buildCompanyEnrichmentAgent() {
   // Create tools
   const searchTool = new TavilySearch({ maxResults: 4 });
-  const apolloTool = new ApolloCompanyTool();
+  const enrichCompany = enrichCompanyTool();
   const model = new ChatOpenAI({ temperature: 0 });
 
-  const domainExtract = tool(
-    async ({ results }) => {
-      try {
-        // The input will be the search results
-        const response = await model.invoke([
-          new HumanMessage(
-            `Extract the official website domain (just the domain, like "example.com") for the company from these search results. Only return the domain without any explanation or additional text.
-            Avoid using the result that may come from linkedin or crunchbase, use the official website result.
-            Search results:
-            ${JSON.stringify(results)}`
-          ),
-        ]);
-
-        console.log("extracting", response.content);
-
-        return response.content;
-      } catch (error) {
-        return `Error extracting domain: ${error}`;
-      }
-    },
-    {
-      name: "domain_extract",
-      description: "Call to surf the web.",
-      schema: z.object({
-        results: z
-          .array(
-            z.object({
-              title: z.string(),
-              url: z.string(),
-              content: z.string(),
-            })
-          )
-          .describe("The search results to extract the domain from"),
-      }),
-    }
-  );
-
   // Define state handlers
-
   // Process the initial query to extract company name
   async function processQuery(state: any): Promise<any> {
     const lastMessage = state.messages[state.messages.length - 1];
@@ -110,63 +46,21 @@ async function buildCompanyEnrichmentAgent() {
     if (lastMessage.content && typeof lastMessage.content === "string") {
       // Extract company name using LLM
       const response = await model.invoke([
-        new HumanMessage(`Extract just the company name from this query: "${lastMessage.content}"
-        Only return the company name without any explanation or additional text.`),
+        new HumanMessage(`Extract just the company domain from this query: "${lastMessage.content}"
+        Only return the domain without any explanation or additional text.`),
       ]);
 
-      const companyName = response.content.toString().trim();
+      const domain = response.content.toString().trim();
 
       return {
-        companyName,
-        currentStep: "search",
+        companyDomain: domain,
+        currentStep: "enrich",
       };
     }
 
     return {
       error: "Could not extract company name",
       currentStep: "end",
-    };
-  }
-
-  // Search for company information
-  async function searchCompany(state: any): Promise<any> {
-    if (!state.companyName) {
-      return {
-        error: "No company name provided",
-        currentStep: "end",
-      };
-    }
-
-    const searchQuery = `${state.companyName} official website`;
-    const { results } = await searchTool.invoke({ query: searchQuery });
-
-    return {
-      messages: [
-        ...state.messages,
-        new AIMessage(`Searched for ${state.companyName}`),
-      ],
-      currentStep: "extract_domain",
-      companyName: state.companyName,
-      companyInfo: { results },
-    };
-  }
-
-  // Extract domain from search results
-  async function extractDomain(state: any): Promise<any> {
-    if (!state.companyInfo?.results) {
-      return {
-        error: "No search results available",
-        currentStep: "end",
-      };
-    }
-
-    const domain = await domainExtract.invoke({
-      results: state.companyInfo.results,
-    });
-
-    return {
-      companyDomain: domain,
-      currentStep: "enrich",
     };
   }
 
@@ -179,7 +73,9 @@ async function buildCompanyEnrichmentAgent() {
       };
     }
 
-    const companyDataRaw = await apolloTool.invoke(state.companyDomain);
+    const companyDataRaw = await enrichCompany.invoke({
+      domain: state.companyDomain,
+    });
     let companyData;
 
     try {
@@ -190,8 +86,75 @@ async function buildCompanyEnrichmentAgent() {
 
     return {
       companyInfo: companyData,
-      currentStep: "summarize",
+      currentStep: "search_managers",
     };
+  }
+
+  // // Search for CTO information
+  // async function searchCTOLead(state: any): Promise<any> {
+  //   if (!state.companyInfo.name) {
+  //     return {
+  //       error: "No company name provided",
+  //       currentStep: "end",
+  //     };
+  //   }
+
+  //   const searchQuery = `cto ${state.companyInfo.name} site:linkedin.com`;
+  //   const { results } = await searchTool.invoke({ query: searchQuery });
+  //   console.log("RESULTS FOR CTO", results);
+
+  //   return {
+  //     messages: [
+  //       ...state.messages,
+  //       new AIMessage(`Searched for ${state.companyName}`),
+  //     ],
+  //     currentStep: "search_managers",
+  //   };
+  // }
+
+  // Search for manager leads
+  async function searchManagerLeads(state: any): Promise<any> {
+    if (!state.companyInfo.name) {
+      return {
+        error: "No company name provided",
+        currentStep: "end",
+      };
+    }
+
+    const searchQuery = `senior engineering manager OR head of engineering ${state.companyInfo.name} site:linkedin.com`;
+    const { results } = await searchTool.invoke({ query: searchQuery });
+    console.log("search RESULTS FOR MANAGERS", results);
+
+    const llmResponse = await model.invoke([
+      new HumanMessage(`
+        Extract an array of objects with the following structure
+        For example:
+        [{
+          name: "",
+          linkedin_url: "",
+        }]
+          Use this example as the format, the data should come from the list of results
+        ###
+        List to use:
+        ${results}
+        `),
+    ]);
+
+    // Parse the response into a properly typed array
+    try {
+      // Now you can use the parsed leads
+      return {
+        messages: [...state.messages],
+        leads: llmResponse.content,
+        currentStep: "summarize",
+      };
+    } catch (error) {
+      console.error("Failed to parse leads:", error);
+      return {
+        error: "Failed to parse leads data",
+        currentStep: "end",
+      };
+    }
   }
 
   // Summarize the findings
@@ -223,13 +186,21 @@ async function buildCompanyEnrichmentAgent() {
   }
 
   // Create the graph
-
   const StateAnnotation = Annotation.Root({
     companyName: Annotation<string>,
     companyDomain: Annotation<string>,
     companyInfo: Annotation<string>,
     currentStep: Annotation<string>,
     error: Annotation<string>,
+    leads: Annotation<Lead[]>({
+      default: () => [],
+      reducer: (left: Lead[], right: Lead | Lead[]) => {
+        if (Array.isArray(right)) {
+          return [...left, ...right];
+        }
+        return [...left, right];
+      },
+    }),
     messages: Annotation<BaseMessage[]>({
       reducer: (left: BaseMessage[], right: BaseMessage | BaseMessage[]) => {
         if (Array.isArray(right)) {
@@ -242,25 +213,24 @@ async function buildCompanyEnrichmentAgent() {
   });
   const workflow = new StateGraph(StateAnnotation);
 
-  return workflow
-    .addNode("process_query", processQuery)
-    .addNode("search", searchCompany)
-    .addNode("extract_domain", extractDomain)
-    .addNode("enrich", enrichCompanyData)
-    .addNode("summarize", summarizeFindings)
-    .addEdge(START, "process_query")
-    .addEdge("process_query", "search")
-    .addEdge("search", "extract_domain")
-    .addEdge("extract_domain", "enrich")
-    .addEdge("enrich", "summarize")
-    .addEdge("summarize", END)
-    .compile();
+  return (
+    workflow
+      .addNode("process_query", processQuery)
+      .addNode("enrich", enrichCompanyData)
+      // .addNode("search_cto", searchCTOLead)
+      .addNode("search_managers", searchManagerLeads)
+      .addNode("summarize", summarizeFindings)
+      .addEdge(START, "process_query")
+      .addEdge("process_query", "enrich")
+      .addEdge("enrich", "search_managers")
+      .addEdge("search_managers", "summarize")
+      .addEdge("summarize", END)
+      .compile()
+  );
 }
 
 // Main function to run the agent
 async function processCompany(companyQuery: string) {
-  console.log(companyQuery);
-
   const agent = await buildCompanyEnrichmentAgent();
 
   const initialState = {
@@ -282,9 +252,9 @@ async function processCompany(companyQuery: string) {
   return {
     success: true,
     summary: result.messages[result.messages.length - 1].content,
-    companyName: result.companyName,
     companyDomain: result.companyDomain,
     companyData: result.companyInfo,
+    leads: result.leads,
   };
 }
 
@@ -295,7 +265,7 @@ export { processCompany };
 if (require.main === module) {
   // You can test the agent directly by calling this function
   const testCompany = async () => {
-    const result = await processCompany("Tell me about Develative");
+    const result = await processCompany("Leads for c2fo.com");
     console.log(JSON.stringify(result, null, 2));
   };
 
